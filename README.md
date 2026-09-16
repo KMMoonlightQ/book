@@ -6,11 +6,9 @@
 
 支持 macOS 14 及以上、Apple Silicon（arm64）。安装包已编译，无需安装 Rust。
 
-源码和安装包位于私有仓库 `KMMoonlightQ/book`。下载使用已登录的 GitHub CLI，账号需要有该仓库的访问权限；已有可用登录时无需重新登录。
+源码和安装包均已公开。安装时无需 GitHub 登录或仓库授权。
 
 ```sh
-brew install gh
-gh auth login
 brew install KMMoonlightQ/tools/book
 book
 ```
