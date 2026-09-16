@@ -160,3 +160,64 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
     lines
 }
+
+/// 判断一行是否为章节标题（第X章/回/节/卷、Chapter N、楔子/序章/尾声/番外等）
+pub fn is_chapter_heading(line: &str) -> bool {
+    let s = line.trim();
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 2 || chars.len() > 40 {
+        return false;
+    }
+    if chars[0] == '第' {
+        let mut i = 1;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit() || "零一二三四五六七八九十百千万两".contains(chars[i]))
+        {
+            i += 1;
+        }
+        if i > 1 && i < chars.len() && "章节回卷部幕".contains(chars[i]) {
+            // “第X章”后应是空白或行尾，避免误匹配正文（如“第1章第1段……”）
+            return i + 1 == chars.len() || chars[i + 1].is_whitespace();
+        }
+    }
+    if s.to_ascii_uppercase().starts_with("CHAPTER ") {
+        return true;
+    }
+    for prefix in ["楔子", "序章", "序言", "尾声", "终章", "番外"] {
+        if s.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 把纯文本按章节标题拆分为 (标题, 正文) 列表；开头没有标题的部分也保留为一章
+pub fn split_chapters(text: &str) -> Vec<(String, String)> {
+    let mut chapters: Vec<(String, String)> = Vec::new();
+    let mut current = String::new();
+
+    for line in text.lines() {
+        if is_chapter_heading(line) {
+            if !current.trim().is_empty() {
+                push_chapter(&mut chapters, std::mem::take(&mut current));
+            }
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() || chapters.is_empty() {
+        push_chapter(&mut chapters, current);
+    }
+    chapters
+}
+
+fn push_chapter(chapters: &mut Vec<(String, String)>, body: String) {
+    let title = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(24).collect())
+        .unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
+    chapters.push((title, body));
+}

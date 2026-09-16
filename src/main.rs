@@ -5,30 +5,43 @@ mod progress;
 mod text;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::DefaultTerminal;
-use std::io::IsTerminal;
 
-use library::{Book, Format};
+use library::{Book, Chapter};
 use progress::Progress;
 
 enum Screen {
     Library,
     Reader,
+    /// 章节选择页
+    Toc,
 }
 
 struct ReaderState {
     book_index: usize,
-    /// 清洗后的纯文本（用于宽度变化时重新折行）
-    raw: String,
-    /// 折行后的全部行
-    lines: Vec<String>,
-    /// lines 对应的折行宽度，宽度变化时重新折行
+    chapters: Vec<Chapter>,
+    /// 当前章节
+    chapter: usize,
+    /// 各章节 lines 对应的折行宽度，宽度变化时重新折行
     wrap_width: u16,
-    /// 当前滚动到的行号（首行）
+    /// 当前章节内滚动到的行号（首行）
     offset: usize,
+    /// 章节选择页的列表状态
+    toc_state: ListState,
+}
+
+impl ReaderState {
+    fn current(&self) -> &Chapter {
+        &self.chapters[self.chapter]
+    }
+
+    fn max_offset(&self, page: usize) -> usize {
+        self.current().lines.len().saturating_sub(page)
+    }
 }
 
 struct App {
@@ -40,33 +53,6 @@ struct App {
 }
 
 fn main() {
-    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    if !arguments.is_empty() {
-        if arguments.len() == 1 {
-            if arguments[0] == "--version" || arguments[0] == "-V" {
-                println!("book {}", env!("CARGO_PKG_VERSION"));
-                return;
-            }
-            if arguments[0] == "--help" || arguments[0] == "-h" {
-                println!(
-                    "book — 终端电子书阅读器\n\n用法: book [--help | --version]\n\n\
-                     支持 TXT / EPUB / MOBI。首次运行会创建 ~/.config/book.toml。\n\
-                     默认书库: ~/books；可通过 library_dir 修改。\n\
-                     书架: ↑/↓ 或 j/k 选择，Enter 打开，q 退出。\n\
-                     阅读: ↑/↓ 滚动，←/→ 或 p/n 翻页，Esc 保存进度并返回书架。\n\
-                     BOOK_CONFIG_DIR 可指定独立的配置和阅读进度目录。"
-                );
-                return;
-            }
-        }
-        eprintln!("不支持的参数；请运行 book --help 查看用法。");
-        std::process::exit(2);
-    }
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        eprintln!("请在交互式终端中运行 book。");
-        std::process::exit(1);
-    }
-
     let (_, library_dir) = match config::load() {
         Ok(v) => v,
         Err(msg) => {
@@ -118,6 +104,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
             }
             Screen::Reader => handle_reader_key(app, key.code),
+            Screen::Toc => handle_toc_key(app, key.code),
         }
     }
 }
@@ -147,21 +134,32 @@ fn handle_library_key(app: &mut App, code: KeyCode) -> bool {
 
 fn open_book(app: &mut App, index: usize) {
     let book = &app.books[index];
-    if let Ok(raw) = library::load_text(book) {
-        let plain = if matches!(book.format, Format::Txt) {
-            raw
-        } else {
-            text::strip_html(&raw)
-        };
-        let saved = app.progress.get(&book.key());
-        app.reader = Some(ReaderState {
-            book_index: index,
-            raw: plain,
-            lines: Vec::new(),
-            wrap_width: 0,
-            offset: saved,
-        });
-        app.screen = Screen::Reader;
+    let Ok(mut chapters) = library::load_chapters(book) else {
+        return;
+    };
+    if chapters.is_empty() {
+        return;
+    }
+    let saved = app.progress.get(&book.key());
+    let chapter = saved.chapter().min(chapters.len() - 1);
+    let mut toc_state = ListState::default();
+    toc_state.select(Some(chapter));
+    app.reader = Some(ReaderState {
+        book_index: index,
+        chapters: std::mem::take(&mut chapters),
+        chapter,
+        wrap_width: 0,
+        offset: saved.offset(),
+        toc_state,
+    });
+    app.screen = Screen::Reader;
+}
+
+fn save_position(app: &mut App) {
+    if let Some(reader) = &app.reader {
+        let key = app.books[reader.book_index].key();
+        app.progress.set(key, reader.chapter, reader.offset);
+        app.progress.save();
     }
 }
 
@@ -170,38 +168,93 @@ fn handle_reader_key(app: &mut App, code: KeyCode) {
     let Some(reader) = app.reader.as_mut() else {
         return;
     };
-    let max_offset = reader.lines.len().saturating_sub(page);
+    let max_offset = reader.max_offset(page);
     match code {
         KeyCode::Esc => {
-            // 保存进度并返回书架
-            let key = app.books[reader.book_index].key();
-            app.progress.set(key, reader.offset);
-            app.progress.save();
+            save_position(app);
             app.screen = Screen::Library;
             app.reader = None;
         }
-        KeyCode::Up => reader.offset = reader.offset.saturating_sub(1),
-        KeyCode::Down => reader.offset = (reader.offset + 1).min(max_offset),
-        KeyCode::Left | KeyCode::Char('p') => reader.offset = reader.offset.saturating_sub(page),
+        KeyCode::Char('i') => {
+            reader.toc_state.select(Some(reader.chapter));
+            app.screen = Screen::Toc;
+        }
+        KeyCode::Up => {
+            if reader.offset == 0 && reader.chapter > 0 {
+                // 章节开头继续向上：进入上一章末尾
+                reader.chapter -= 1;
+                reader.offset = reader.max_offset(page);
+            } else {
+                reader.offset = reader.offset.saturating_sub(1);
+            }
+        }
+        KeyCode::Down => {
+            if reader.offset >= max_offset && reader.chapter + 1 < reader.chapters.len() {
+                reader.chapter += 1;
+                reader.offset = 0;
+            } else {
+                reader.offset = (reader.offset + 1).min(max_offset);
+            }
+        }
+        KeyCode::Left | KeyCode::Char('p') => {
+            if reader.offset == 0 && reader.chapter > 0 {
+                reader.chapter -= 1;
+                reader.offset = reader.max_offset(page);
+            } else {
+                reader.offset = reader.offset.saturating_sub(page);
+            }
+        }
         KeyCode::Right | KeyCode::Char('n') => {
-            reader.offset = (reader.offset + page).min(max_offset)
+            if reader.offset >= max_offset && reader.chapter + 1 < reader.chapters.len() {
+                reader.chapter += 1;
+                reader.offset = 0;
+            } else {
+                reader.offset = (reader.offset + page).min(max_offset);
+            }
         }
         _ => {}
     }
 }
 
-/// 正文可见行数
+fn handle_toc_key(app: &mut App, code: KeyCode) {
+    let Some(reader) = app.reader.as_mut() else {
+        return;
+    };
+    let len = reader.chapters.len();
+    match code {
+        KeyCode::Esc => app.screen = Screen::Reader,
+        KeyCode::Up | KeyCode::Char('k') => {
+            let i = reader.toc_state.selected().unwrap_or(0);
+            reader.toc_state.select(Some(i.saturating_sub(1)));
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let i = reader.toc_state.selected().unwrap_or(0);
+            reader.toc_state.select(Some((i + 1).min(len.saturating_sub(1))));
+        }
+        KeyCode::Enter => {
+            if let Some(i) = reader.toc_state.selected() {
+                reader.chapter = i;
+                reader.offset = 0;
+            }
+            app.screen = Screen::Reader;
+        }
+        _ => {}
+    }
+}
+
+/// 正文可见行数（底部一行留给进度条）
 fn reader_page_size() -> usize {
     let Ok((_, h)) = crossterm::terminal::size() else {
         return 20;
     };
-    (h as usize).max(1)
+    (h as usize).saturating_sub(1).max(1)
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.screen {
         Screen::Library => draw_library(frame, app),
         Screen::Reader => draw_reader(frame, app),
+        Screen::Toc => draw_toc(frame, app),
     }
 }
 
@@ -225,40 +278,88 @@ fn draw_library(frame: &mut ratatui::Frame, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+fn draw_toc(frame: &mut ratatui::Frame, app: &mut App) {
+    let area = frame.area();
+    let Some(reader) = app.reader.as_mut() else {
+        return;
+    };
+
+    let items: Vec<ListItem> = reader
+        .chapters
+        .iter()
+        .map(|c| ListItem::new(Line::from(c.title.clone())))
+        .collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, area, &mut reader.toc_state);
+}
+
 fn draw_reader(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
-
-    let content_width = area.width;
-    let content_height = area.height as usize;
+    let content_height = (area.height as usize).saturating_sub(1).max(1);
 
     let Some(reader) = app.reader.as_mut() else {
         return;
     };
 
     // 首次打开或终端宽度变化时重新折行；折行后行数可能变化，需按新旧行数比例折算进度
-    if reader.wrap_width != content_width {
-        let old_lines = reader.lines.len().max(1);
+    if reader.wrap_width != area.width {
+        let old_lines = reader.current().lines.len().max(1);
         let old_offset = reader.offset;
-        reader.lines = text::wrap_text(&reader.raw, content_width as usize);
+        for chapter in &mut reader.chapters {
+            chapter.lines = text::wrap_text(&chapter.text, area.width as usize);
+        }
         if reader.wrap_width != 0 {
             // 宽度变化：按比例保持阅读位置
-            reader.offset = old_offset * reader.lines.len() / old_lines;
+            reader.offset = old_offset * reader.current().lines.len() / old_lines;
         }
-        reader.wrap_width = content_width;
+        reader.wrap_width = area.width;
     }
 
-    let page = content_height.max(1);
-    let max_offset = reader.lines.len().saturating_sub(page);
+    let max_offset = reader.max_offset(content_height);
     if reader.offset > max_offset {
         reader.offset = max_offset;
     }
 
     let visible: Vec<Line> = reader
+        .current()
         .lines
         .iter()
         .skip(reader.offset)
-        .take(page)
+        .take(content_height)
         .map(|l| Line::from(l.clone()))
         .collect();
-    frame.render_widget(Paragraph::new(visible), area);
+    frame.render_widget(
+        Paragraph::new(visible),
+        ratatui::layout::Rect::new(area.x, area.y, area.width, content_height as u16),
+    );
+
+    // 底部进度条：[####------]30%，按当前章节计算
+    let total = reader.current().lines.len().max(1);
+    let percent = (reader.offset + content_height).min(total) * 100 / total;
+    let cells = 10;
+    let filled = (percent / 10 + 1).min(cells);
+    let bar = format!(
+        "[{}{}]{}%",
+        "#".repeat(filled),
+        "-".repeat(cells - filled),
+        percent
+    );
+    frame.render_widget(
+        Paragraph::new(bar)
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        ratatui::layout::Rect::new(
+            area.x,
+            area.y + content_height as u16,
+            area.width,
+            1,
+        ),
+    );
 }

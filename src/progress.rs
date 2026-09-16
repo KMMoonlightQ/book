@@ -2,10 +2,34 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 
+/// 阅读位置：兼容旧版（整书行号）和新版（章节 + 章内行号）
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Position {
+    Line(usize),
+    Chapter { chapter: usize, offset: usize },
+}
+
+impl Position {
+    pub fn chapter(self) -> usize {
+        match self {
+            Position::Line(_) => 0,
+            Position::Chapter { chapter, .. } => chapter,
+        }
+    }
+
+    pub fn offset(self) -> usize {
+        match self {
+            Position::Line(offset) => offset,
+            Position::Chapter { offset, .. } => offset,
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Progress {
     #[serde(default)]
-    pub positions: HashMap<String, usize>,
+    pub positions: HashMap<String, Position>,
 }
 
 impl Progress {
@@ -24,11 +48,12 @@ impl Progress {
         }
     }
 
-    pub fn get(&self, key: &str) -> usize {
-        self.positions.get(key).copied().unwrap_or(0)
+    pub fn get(&self, key: &str) -> Position {
+        self.positions.get(key).copied().unwrap_or(Position::Line(0))
     }
 
-    pub fn set(&mut self, key: String, offset: usize) {
-        self.positions.insert(key, offset);
+    pub fn set(&mut self, key: String, chapter: usize, offset: usize) {
+        self.positions
+            .insert(key, Position::Chapter { chapter, offset });
     }
 }
