@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::DefaultTerminal;
+use std::io::IsTerminal;
 
 use library::{Book, Chapter};
 use progress::Progress;
@@ -30,6 +31,8 @@ struct ReaderState {
     wrap_width: u16,
     /// 当前章节内滚动到的行号（首行）
     offset: usize,
+    /// 首次折行后恢复位置，兼容旧版整书行号。
+    restore_position: Option<progress::Position>,
     /// 章节选择页的列表状态
     toc_state: ListState,
 }
@@ -53,6 +56,33 @@ struct App {
 }
 
 fn main() {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if !arguments.is_empty() {
+        if arguments.len() == 1 {
+            if arguments[0] == "--version" || arguments[0] == "-V" {
+                println!("book {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            if arguments[0] == "--help" || arguments[0] == "-h" {
+                println!(
+                    "book — 终端电子书阅读器\n\n用法: book [--help | --version]\n\n\
+                     支持 TXT / EPUB / MOBI。首次运行会创建 ~/.config/book.toml。\n\
+                     默认书库: ~/books；可通过 library_dir 修改。\n\
+                     书架: ↑/↓ 或 j/k 选择，Enter 打开，q 退出。\n\
+                     阅读: ↑/↓ 滚动，←/→ 或 p/n 翻页，i 选择章节，Esc 保存进度并返回书架。\n\
+                     BOOK_CONFIG_DIR 可指定独立的配置和阅读进度目录。"
+                );
+                return;
+            }
+        }
+        eprintln!("不支持的参数；请运行 book --help 查看用法。");
+        std::process::exit(2);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("请在交互式终端中运行 book。");
+        std::process::exit(1);
+    }
+
     let (_, library_dir) = match config::load() {
         Ok(v) => v,
         Err(msg) => {
@@ -141,7 +171,7 @@ fn open_book(app: &mut App, index: usize) {
         return;
     }
     let saved = app.progress.get(&book.key());
-    let chapter = saved.chapter().min(chapters.len() - 1);
+    let chapter = 0;
     let mut toc_state = ListState::default();
     toc_state.select(Some(chapter));
     app.reader = Some(ReaderState {
@@ -149,7 +179,8 @@ fn open_book(app: &mut App, index: usize) {
         chapters: std::mem::take(&mut chapters),
         chapter,
         wrap_width: 0,
-        offset: saved.offset(),
+        offset: 0,
+        restore_position: Some(saved),
         toc_state,
     });
     app.screen = Screen::Reader;
@@ -229,7 +260,9 @@ fn handle_toc_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let i = reader.toc_state.selected().unwrap_or(0);
-            reader.toc_state.select(Some((i + 1).min(len.saturating_sub(1))));
+            reader
+                .toc_state
+                .select(Some((i + 1).min(len.saturating_sub(1))));
         }
         KeyCode::Enter => {
             if let Some(i) = reader.toc_state.selected() {
@@ -315,7 +348,15 @@ fn draw_reader(frame: &mut ratatui::Frame, app: &mut App) {
         for chapter in &mut reader.chapters {
             chapter.lines = text::wrap_text(&chapter.text, area.width as usize);
         }
-        if reader.wrap_width != 0 {
+        if let Some(saved) = reader.restore_position.take() {
+            let lengths: Vec<_> = reader
+                .chapters
+                .iter()
+                .map(|chapter| chapter.lines.len())
+                .collect();
+            (reader.chapter, reader.offset) = saved.resolve(&lengths);
+            reader.toc_state.select(Some(reader.chapter));
+        } else if reader.wrap_width != 0 {
             // 宽度变化：按比例保持阅读位置
             reader.offset = old_offset * reader.current().lines.len() / old_lines;
         }
@@ -355,11 +396,6 @@ fn draw_reader(frame: &mut ratatui::Frame, app: &mut App) {
         Paragraph::new(bar)
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center),
-        ratatui::layout::Rect::new(
-            area.x,
-            area.y + content_height as u16,
-            area.width,
-            1,
-        ),
+        ratatui::layout::Rect::new(area.x, area.y + content_height as u16, area.width, 1),
     );
 }

@@ -36,7 +36,7 @@ pub struct Chapter {
 pub fn scan(dir: &Path) -> Vec<Book> {
     let mut books = Vec::new();
     collect(dir, &mut books);
-    books.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    books.sort_by_key(|book| book.title.to_lowercase());
     books
 }
 
@@ -64,7 +64,11 @@ fn collect(dir: &Path, books: &mut Vec<Book>) {
             .and_then(|s| s.to_str())
             .unwrap_or("未命名")
             .to_string();
-        books.push(Book { title, path, format });
+        books.push(Book {
+            title,
+            path,
+            format,
+        });
     }
 }
 
@@ -112,7 +116,9 @@ fn load_epub(path: &Path) -> Result<Vec<Chapter>, String> {
 
     // spine item -> toc 标题：通过资源路径匹配目录条目
     let toc_label = |idref: &str| -> Option<String> {
-        let res_path = resources.get(idref).map(|r| r.path.to_string_lossy().into_owned())?;
+        let res_path = resources
+            .get(idref)
+            .map(|r| r.path.to_string_lossy().into_owned())?;
         toc.iter().find_map(|nav| {
             let nav_path = nav.content.to_string_lossy();
             let nav_path = nav_path.split('#').next().unwrap_or("");

@@ -11,18 +11,60 @@ pub enum Position {
 }
 
 impl Position {
-    pub fn chapter(self) -> usize {
+    /// 旧版行号属于整本书，折行后才能映射到新版本的章节位置。
+    pub fn resolve(self, chapter_lengths: &[usize]) -> (usize, usize) {
+        if chapter_lengths.is_empty() {
+            return (0, 0);
+        }
         match self {
-            Position::Line(_) => 0,
-            Position::Chapter { chapter, .. } => chapter,
+            Position::Line(mut offset) => {
+                for (chapter, &length) in chapter_lengths.iter().enumerate() {
+                    if offset < length || chapter + 1 == chapter_lengths.len() {
+                        return (chapter, offset.min(length.saturating_sub(1)));
+                    }
+                    offset -= length;
+                }
+                unreachable!()
+            }
+            Position::Chapter { chapter, offset } => {
+                (chapter.min(chapter_lengths.len() - 1), offset)
+            }
         }
     }
+}
 
-    pub fn offset(self) -> usize {
-        match self {
-            Position::Line(offset) => offset,
-            Position::Chapter { offset, .. } => offset,
-        }
+#[cfg(test)]
+mod tests {
+    use super::{Position, Progress};
+
+    #[test]
+    fn legacy_progress_restores_a_later_chapter() {
+        let progress: Progress = toml::from_str("[positions]\nbook = 70\n").unwrap();
+        assert_eq!(progress.get("book").resolve(&[61, 61]), (1, 9));
+        assert_eq!(Position::Line(61).resolve(&[61, 61]), (1, 0));
+    }
+
+    #[test]
+    fn chapter_progress_round_trips_alongside_legacy_entries() {
+        let mut progress: Progress = toml::from_str("[positions]\nold = 70\n").unwrap();
+        progress.set("new".to_string(), 1, 23);
+        let restored: Progress = toml::from_str(&toml::to_string(&progress).unwrap()).unwrap();
+        assert_eq!(restored.get("old").resolve(&[61, 61]), (1, 9));
+        assert_eq!(restored.get("new").resolve(&[61, 61]), (1, 23));
+    }
+
+    #[test]
+    fn progress_handles_shortened_or_empty_books() {
+        assert_eq!(Position::Line(999).resolve(&[20, 30]), (1, 29));
+        assert_eq!(Position::Line(10).resolve(&[]), (0, 0));
+        assert_eq!(
+            Position::Chapter {
+                chapter: 9,
+                offset: 10
+            }
+            .resolve(&[20]),
+            (0, 10)
+        );
     }
 }
 
@@ -49,7 +91,10 @@ impl Progress {
     }
 
     pub fn get(&self, key: &str) -> Position {
-        self.positions.get(key).copied().unwrap_or(Position::Line(0))
+        self.positions
+            .get(key)
+            .copied()
+            .unwrap_or(Position::Line(0))
     }
 
     pub fn set(&mut self, key: String, chapter: usize, offset: usize) {
